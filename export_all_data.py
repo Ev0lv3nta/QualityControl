@@ -7,20 +7,28 @@ from typing import Any, Dict, List, Set
 from dotenv import load_dotenv
 import asyncpg
 
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_NAME = os.getenv("DB_NAME", "qualitycontrol")
 # Загружаем переменные окружения из secrets.env и проверяем успех
 if not load_dotenv("secrets.env"):
     raise FileNotFoundError("Файл secrets.env не найден")
 
-required_vars = ("DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME")
-for var in required_vars:
-    if var not in os.environ:
-        raise EnvironmentError(f"Environment variable {var} is not set")
 
-DB_HOST = os.environ["DB_HOST"]
-DB_PORT = int(os.environ["DB_PORT"])
-DB_USER = os.environ["DB_USER"]
-DB_PASS = os.environ["DB_PASS"]
-DB_NAME = os.environ["DB_NAME"]
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise EnvironmentError(f"Environment variable {name} is not set")
+    return value
+
+
+DB_HOST = require_env("DB_HOST")
+DB_PORT = int(require_env("DB_PORT"))
+DB_USER = require_env("DB_USER")
+DB_PASS = require_env("DB_PASS")
+DB_NAME = require_env("DB_NAME")
 
 OUTPUT_FILE = "all_data.csv"
 
@@ -119,8 +127,7 @@ COLUMN_TITLES_RU: Dict[str, str] = {
     "cgp_qr_tare": "QR ЦГП (тара)",
 }
 
-# Добавляем переводы этапов и параметров
-COLUMN_TITLES_RU.update(STAGE_TITLES)
+# Добавляем переводы параметров
 for params in PARAM_TITLES.values():
     COLUMN_TITLES_RU.update(params)
 
@@ -128,6 +135,7 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
     query = """
         SELECT
             cd.user_id,
+            u.name,
             u.full_name,
             u.position,
             cd.stage_name,
@@ -143,6 +151,13 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
         return await conn.fetch(query)
 
 async def export_all_data(filename: str = OUTPUT_FILE) -> None:
+    pool = await asyncpg.create_pool(
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
     try:
         pool = await asyncpg.create_pool(
             user=DB_USER,
@@ -170,23 +185,22 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
         row = {
             "created_at": rec["created_at"],
             "user_id": rec["user_id"],
+            "name": rec["name"],
             "full_name": rec["full_name"],
             "position": rec["position"],
+            "stage_name": rec["stage_name"],
             "stage_name": STAGE_TITLES.get(rec["stage_name"], rec["stage_name"]),
             "forming_session_id": rec["forming_session_id"],
             "value_numeric": rec["value_numeric"],
         }
+        row.update(data)
         row.update(
             {
-
                 k: (
                     PARAM_VALUE_TITLES.get(k, {}).get(v, v)
                     if not isinstance(v, (dict, list))
                     else json.dumps(v, ensure_ascii=False)
                 )
-=======
-                k: PARAM_VALUE_TITLES.get(k, {}).get(v, v)
-
                 for k, v in data.items()
             }
         )
@@ -195,6 +209,7 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
     base_columns = [
         "created_at",
         "user_id",
+        "name",
         "full_name",
         "position",
         "stage_name",
@@ -207,6 +222,7 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
 
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
+        writer.writeheader()
         # Записываем русские заголовки колонок
         writer.writerow({k: COLUMN_TITLES_RU.get(k, k) for k in fieldnames})
         for row in rows:
