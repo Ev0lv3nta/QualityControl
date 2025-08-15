@@ -101,6 +101,7 @@ db_pool: Optional[asyncpg.Pool] = None
 
 # token -> { 'user_id': int, 'goods': str, 'tare': Optional[str], 'created_at': datetime }
 ACCUM_CONTINUE_TOKENS: Dict[str, Dict[str, Any]] = {}
+CGP_CONTINUE_TOKENS: Dict[str, Dict[str, Any]] = {}
 
 # =====================================================
 # СОСТОЯНИЯ FSM
@@ -546,9 +547,14 @@ async def finish_process(message: Message, state: FSMContext):
         await state.clear()
         if chat_id and last_bot_message_id:
             try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=last_bot_message_id, text="❌ Произошла ошибка при сохранении данных.", reply_markup=None)
-            except Exception:
-                pass
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=last_bot_message_id,
+                    text="❌ Произошла ошибка при сохранении данных.",
+                    reply_markup=None,
+                )
+            except Exception as e:
+                logger.exception("Не удалось отредактировать сообщение об ошибке", exc_info=e)
         await message.answer("Попробуйте снова.", reply_markup=main_menu_kb())
         return
 
@@ -557,8 +563,10 @@ async def finish_process(message: Message, state: FSMContext):
     if process_name == "forming":
         success_text = f"✅ Данные для <b>Образца №{data['sample_number']}</b> сохранены."
         if chat_id and last_bot_message_id:
-            try: await bot.edit_message_text(text=success_text, chat_id=chat_id, message_id=last_bot_message_id, reply_markup=None)
-            except Exception: pass
+            try:
+                await bot.edit_message_text(text=success_text, chat_id=chat_id, message_id=last_bot_message_id, reply_markup=None)
+            except Exception as e:
+                logger.exception("Не удалось отредактировать сообщение об успехе (формовка)", exc_info=e)
         await state.set_state(Process.forming_confirm_next)
         sent_msg = await message.answer(
             "Что делаем дальше?",
@@ -574,8 +582,10 @@ async def finish_process(message: Message, state: FSMContext):
         success_text = f"✅ Данные для этапа <b>'{stage_title}'</b> успешно сохранены."
         await state.clear()
         if chat_id and last_bot_message_id:
-            try: await bot.edit_message_text(text=success_text, chat_id=chat_id, message_id=last_bot_message_id, reply_markup=None)
-            except Exception: pass
+            try:
+                await bot.edit_message_text(text=success_text, chat_id=chat_id, message_id=last_bot_message_id, reply_markup=None)
+            except Exception as e:
+                logger.exception("Не удалось отредактировать сообщение об успехе", exc_info=e)
         await message.answer("Выберите этап контроля:", reply_markup=main_menu_kb())
 
 # =====================================================
@@ -623,8 +633,15 @@ async def process_registration_position_cb(callback: CallbackQuery, state: FSMCo
     ok = await db_execute("UPDATE users SET position = $1 WHERE user_id = $2", position, user_id)
     if ok:
         await state.clear()
-        try: await bot.edit_message_text(text="✅ Спасибо! Данные регистрации сохранены.", chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
-        except Exception: pass
+        try:
+            await bot.edit_message_text(
+                text="✅ Спасибо! Данные регистрации сохранены.",
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+                reply_markup=None,
+            )
+        except Exception as e:
+            logger.exception("Не удалось отредактировать сообщение регистрации", exc_info=e)
         await callback.message.answer("Теперь вы можете выбрать этап контроля:", reply_markup=main_menu_kb())
     else:
         await callback.message.answer("❌ Не удалось сохранить должность. Попробуйте ещё раз.")
@@ -635,6 +652,9 @@ def _cleanup_expired_tokens():
     for k, v in list(ACCUM_CONTINUE_TOKENS.items()):
         if (now - v.get('created_at', now)).total_seconds() > TOKEN_TTL_SECONDS:
             ACCUM_CONTINUE_TOKENS.pop(k, None)
+    for k, v in list(CGP_CONTINUE_TOKENS.items()):
+        if (now - v.get('created_at', now)).total_seconds() > TOKEN_TTL_SECONDS:
+            CGP_CONTINUE_TOKENS.pop(k, None)
 
 
 async def _token_cleanup_scheduler():
@@ -664,8 +684,15 @@ async def process_cancel_callback(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(fsm_state=await state.get_state())
     await save_state_to_db(callback.from_user.id, state)
-    try: await bot.edit_message_text(text="🏠 Вы в главном меню.", chat_id=callback.message.chat.id, message_id=callback.message.message_id, reply_markup=None)
-    except Exception: pass
+    try:
+        await bot.edit_message_text(
+            text="🏠 Вы в главном меню.",
+            chat_id=callback.message.chat.id,
+            message_id=callback.message.message_id,
+            reply_markup=None,
+        )
+    except Exception as e:
+        logger.exception("Не удалось отредактировать сообщение при отмене", exc_info=e)
     await callback.message.answer("Выберите этап контроля:", reply_markup=main_menu_kb())
     await callback.answer()
 
@@ -679,8 +706,10 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext):
         data = await state.get_data()
         last_message_id = data.get('last_bot_message_id'); chat_id = data.get('chat_id')
         if last_message_id and chat_id:
-            try: await bot.delete_message(chat_id, last_message_id)
-            except: pass
+            try:
+                await bot.delete_message(chat_id, last_message_id)
+            except Exception as e:
+                logger.exception("Не удалось удалить предыдущее сообщение", exc_info=e)
         fsm_state = await state.get_state()
         if fsm_state == Process.waiting_for_param_photo.state:
             sent = await callback.message.answer("📷 Фото обязательно. Пришлите фото или нажмите '🏠 Главное меню'.", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="cancel_action")]]))
@@ -783,13 +812,21 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext):
                 goods = d.get('cgp_qr_goods') or d.get('cgp_qr_text')
         if goods:
             token = secrets.token_urlsafe(12)
-            ACCUM_CONTINUE_TOKENS[token] = {'user_id': user.id, 'goods': str(goods), 'tare': tare, 'created_at': datetime.now()}
+            CGP_CONTINUE_TOKENS[token] = {
+                'user_id': user.id,
+                'goods': str(goods),
+                'tare': tare,
+                'created_at': datetime.now(),
+            }
             keyboard_rows = [
                 [types.InlineKeyboardButton(text=f"↩️ Продолжить паллет {str(goods)[:40]}", callback_data=f"cgp_continue:{token}")],
                 [types.InlineKeyboardButton(text="➕ Сканировать новый паллет", callback_data="cgp_new")],
-                [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="cancel_action")]
+                [types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="cancel_action")],
             ]
-            await callback.message.edit_text("<b>Этап 4: ЦГП</b>\nВыберите действие:", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows))
+            await callback.message.edit_text(
+                "<b>Этап 4: ЦГП</b>\nВыберите действие:",
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard_rows),
+            )
             await state.update_data(last_bot_message_id=callback.message.message_id, chat_id=callback.message.chat.id)
         else:
             await state.set_state(Process.waiting_for_qr)
@@ -848,8 +885,10 @@ async def accumulation_continue_handler(callback: CallbackQuery, state: FSMConte
     await clear_state_for_process(callback.from_user.id, "accumulation")
     await state.set_state(Process.param_menu)
     await show_param_menu(callback.message, state)
-    try: del ACCUM_CONTINUE_TOKENS[token]
-    except Exception: pass
+    try:
+        del ACCUM_CONTINUE_TOKENS[token]
+    except Exception as e:
+        logger.exception("Ошибка удаления токена накопления", exc_info=e)
     await callback.answer()
 
 async def forming_new_handler(callback: CallbackQuery, state: FSMContext):
@@ -918,11 +957,11 @@ async def cgp_continue_handler(callback: CallbackQuery, state: FSMContext):
         token = callback.data.split(":", 1)[1]
     except Exception:
         await callback.answer(); return
-    tok_data = ACCUM_CONTINUE_TOKENS.get(token)
+    tok_data = CGP_CONTINUE_TOKENS.get(token)
     if not tok_data or tok_data.get('user_id') != callback.from_user.id:
         await callback.answer("Не удалось найти паллет.", show_alert=True); return
     if (datetime.now() - tok_data.get('created_at', datetime.now())).total_seconds() > TOKEN_TTL_SECONDS:
-        ACCUM_CONTINUE_TOKENS.pop(token, None)
+        CGP_CONTINUE_TOKENS.pop(token, None)
         await callback.answer("Ссылка устарела. Создайте новую через меню.", show_alert=True); return
 
     await state.update_data(
@@ -936,8 +975,10 @@ async def cgp_continue_handler(callback: CallbackQuery, state: FSMContext):
     await clear_state_for_process(callback.from_user.id, "cgp")
     await state.set_state(Process.param_menu)
     await show_param_menu(callback.message, state)
-    try: del ACCUM_CONTINUE_TOKENS[token]
-    except Exception: pass
+    try:
+        del CGP_CONTINUE_TOKENS[token]
+    except Exception as e:
+        logger.exception("Ошибка удаления токена ЦГП", exc_info=e)
     await callback.answer()
 
 async def param_open_handler(callback: CallbackQuery, state: FSMContext):
@@ -976,16 +1017,15 @@ async def process_qr_code(message: Message, state: FSMContext):
         await message.answer("⚠️ Не удалось загрузить фото. Попробуйте ещё раз."); return
 
     results = await decode_multi_qr_from_image_async(local_file_path)
-    if not results:
-        await message.answer("⚠️ QR-коды не распознаны. Пришлите фото так, чтобы оба кода были видны."); return
+    if not results or len(results) != 2:
+        await message.answer(
+            "⚠️ Не удалось распознать два QR-кода. Отправьте фото так, чтобы слева была тара, а справа товар."
+        )
+        return
 
-    # Левый = тара, правый = товар. Если один — считаем его «товар».
-    if len(results) == 1:
-        tare_text = None
-        goods_text = results[0]['text']
-    else:
-        tare_text = results[0]['text']
-        goods_text = results[1]['text']
+    # Левый = тара, правый = товар
+    tare_text = results[0]['text']
+    goods_text = results[1]['text']
 
     lines = []
     if tare_text: lines.append(f"Тара: <code>{escape(tare_text)}</code>")
@@ -1000,8 +1040,8 @@ async def process_qr_code(message: Message, state: FSMContext):
         session_id = await db_fetchval(
             """
             WITH ins AS (
-                INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tg_file_id, frame_qr_image_path)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tare, frame_qr_tg_file_id, frame_qr_image_path)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT DO NOTHING
                 RETURNING session_id
             )
@@ -1011,7 +1051,7 @@ async def process_qr_code(message: Message, state: FSMContext):
             WHERE frame_qr_text = $2 AND user_id = $1 AND completed_at IS NULL
             LIMIT 1;
             """,
-            user.id, goods_text, file.file_id, local_file_path
+            user.id, goods_text, tare_text, file.file_id, local_file_path
         )
         if session_id:
             await state.update_data(
@@ -1029,6 +1069,7 @@ async def process_qr_code(message: Message, state: FSMContext):
                 pending_photo_param_key=None,
             )
             await state.set_state(Process.param_menu)
+            await save_state_to_db(user.id, state)
             await show_param_menu(message, state)
         else:
             owner_info = await db_fetchall(
@@ -1058,9 +1099,10 @@ async def process_qr_code(message: Message, state: FSMContext):
             accumulation_qr_goods=goods_text,
             accumulation_qr_text=goods_text,  # совместимость
             accumulation_qr_tg_file_id=file.file_id, accumulation_qr_image_path=local_file_path,
-            values={}, photos={}, pending_photo_required=False, pending_photo_param_key=None
+            values={}, photos={}, pending_photo_required=False, pending_photo_param_key=None,
         )
         await clear_state_for_process(user.id, "accumulation")
+        await save_state_to_db(user.id, state)
         await show_param_menu(message, state)
 
     elif process_name_after_qr == "packaging":
@@ -1080,6 +1122,7 @@ async def process_qr_code(message: Message, state: FSMContext):
             control_dir=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
         )
         await clear_state_for_process(user.id, "packaging")
+        await save_state_to_db(user.id, state)
         await show_param_menu(message, state)
 
     elif process_name_after_qr == "cgp":
@@ -1090,12 +1133,14 @@ async def process_qr_code(message: Message, state: FSMContext):
             cgp_qr_goods=goods_text,
             cgp_qr_text=goods_text,  # совместимость
             cgp_qr_tg_file_id=file.file_id, cgp_qr_image_path=local_file_path,
-            values={}, photos={}, pending_photo_required=False, pending_photo_param_key=None
+            values={}, photos={}, pending_photo_required=False, pending_photo_param_key=None,
         )
         await clear_state_for_process(user.id, "cgp")
+        await save_state_to_db(user.id, state)
         await show_param_menu(message, state)
 
     await state.update_data(process_name_after_qr=None)
+    await save_state_to_db(user.id, state)
 
 async def process_qr_invalid(message: Message):
     await message.answer("📷 Пожалуйста, отправьте фото с QR-кодами.")
@@ -1182,7 +1227,8 @@ async def process_step_answer(message: Message, state: FSMContext):
             last_id = data.get('last_bot_message_id'); chat_id = data.get('chat_id')
             if last_id and chat_id:
                 await bot.edit_message_reply_markup(chat_id=chat_id, message_id=last_id, reply_markup=None)
-        except Exception: pass
+        except Exception as e:
+            logger.exception("Не удалось убрать клавиатуру при требовании фото", exc_info=e)
         await state.update_data(values=current_values, fsm_state=Process.waiting_for_param_photo.state, pending_photo_param_key=current_step['key'], pending_photo_process_name=process_name, pending_photo_required=True)
         await state.set_state(Process.waiting_for_param_photo)
         await save_state_to_db(message.from_user.id, state)
@@ -1213,7 +1259,8 @@ async def process_choice_answer(callback: CallbackQuery, state: FSMContext):
             last_id = data.get('last_bot_message_id'); chat_id = data.get('chat_id')
             if last_id and chat_id:
                 await bot.edit_message_reply_markup(chat_id=chat_id, message_id=last_id, reply_markup=None)
-        except Exception: pass
+        except Exception as e:
+            logger.exception("Не удалось убрать клавиатуру при запросе фото", exc_info=e)
         await state.update_data(values=current_values, fsm_state=Process.waiting_for_param_photo.state, pending_photo_param_key=step_key, pending_photo_process_name=process_name, pending_photo_required=True)
         await state.set_state(Process.waiting_for_param_photo)
         await save_state_to_db(callback.from_user.id, state)
@@ -1226,7 +1273,8 @@ async def process_choice_answer(callback: CallbackQuery, state: FSMContext):
             last_id = data.get('last_bot_message_id'); chat_id = data.get('chat_id')
             if last_id and chat_id:
                 await bot.edit_message_reply_markup(chat_id=chat_id, message_id=last_id, reply_markup=None)
-        except Exception: pass
+        except Exception as e:
+            logger.exception("Не удалось убрать клавиатуру при запросе комментария", exc_info=e)
         await state.update_data(values=current_values, fsm_state=Process.waiting_for_param_comment.state, pending_comment_param_key=step_key, pending_comment_process_name=process_name, pending_comment_required=True)
         await state.set_state(Process.waiting_for_param_comment)
         await save_state_to_db(callback.from_user.id, state)
