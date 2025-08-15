@@ -692,7 +692,7 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext):
     if stage_name == "forming":
         active_forming = await db_fetchall(
             """
-            SELECT session_id, COALESCE(frame_qr_goods, frame_qr_text) AS code
+            SELECT session_id, frame_qr_text AS code
             FROM forming_sessions
             WHERE user_id = $1 AND completed_at IS NULL
             ORDER BY created_at DESC
@@ -980,8 +980,8 @@ async def process_qr_code(message: Message, state: FSMContext):
         session_id = await db_fetchval(
             """
             WITH ins AS (
-                INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tg_file_id, frame_qr_image_path, frame_qr_tare, frame_qr_goods)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tg_file_id, frame_qr_image_path)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT DO NOTHING
                 RETURNING session_id
             )
@@ -991,7 +991,7 @@ async def process_qr_code(message: Message, state: FSMContext):
             WHERE frame_qr_text = $2 AND user_id = $1 AND completed_at IS NULL
             LIMIT 1;
             """,
-            user.id, goods_text, file.file_id, local_file_path, tare_text, goods_text
+            user.id, goods_text, file.file_id, local_file_path
         )
         if session_id:
             await state.update_data(
