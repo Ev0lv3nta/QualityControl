@@ -43,7 +43,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_forming_session
   ON public.forming_sessions(frame_qr_text)
   WHERE completed_at IS NULL;
 
--- 4) Бэкофл данных ЦГП: дублируем старое поле в новое и наоборот
+-- 4) Добавляем хранение кода тары в формовке
+ALTER TABLE public.forming_sessions
+    ADD COLUMN IF NOT EXISTS frame_qr_tare text;
+
+-- 5) Бэкофл данных ЦГП: дублируем старое поле в новое и наоборот
 UPDATE public.control_data
 SET data = jsonb_set(data, '{cgp_qr_goods}', to_jsonb(data->>'cgp_qr_text'), true)
 WHERE stage_name='cgp'
