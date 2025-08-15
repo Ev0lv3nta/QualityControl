@@ -178,7 +178,15 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
         }
         row.update(
             {
+
+                k: (
+                    PARAM_VALUE_TITLES.get(k, {}).get(v, v)
+                    if not isinstance(v, (dict, list))
+                    else json.dumps(v, ensure_ascii=False)
+                )
+=======
                 k: PARAM_VALUE_TITLES.get(k, {}).get(v, v)
+
                 for k, v in data.items()
             }
         )
