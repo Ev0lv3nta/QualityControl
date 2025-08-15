@@ -498,6 +498,13 @@ async def finish_process(message: Message, state: FSMContext):
 
     if process_name == 'forming':
         values['sample_number'] = data.get('sample_number', 1)
+        tare = data.get('frame_qr_tare')
+        goods = data.get('frame_qr_goods') or data.get('frame_qr_text')
+        if tare:
+            values['frame_qr_tare'] = tare
+        if goods:
+            values['frame_qr_goods'] = goods
+            values['frame_qr_text'] = goods  # совместимость
 
     photos_map = data.get('photos')
     if photos_map:
@@ -863,10 +870,23 @@ async def forming_continue_handler(callback: CallbackQuery, state: FSMContext):
         session_id = int(parts[1]) if len(parts) > 1 else None
     except Exception:
         session_id = None
+    goods = await db_fetchval("SELECT frame_qr_text FROM forming_sessions WHERE session_id = $1", session_id)
+    tare = await db_fetchval(
+        "SELECT data->>'frame_qr_tare' FROM control_data WHERE forming_session_id = $1 ORDER BY created_at DESC LIMIT 1",
+        session_id,
+    )
     await state.update_data(
-        user_id=callback.from_user.id, process_name="forming", forming_session_id=session_id,
-        values={}, photos={}, step_index=0,
-        pending_photo_required=False, pending_photo_param_key=None
+        user_id=callback.from_user.id,
+        process_name="forming",
+        forming_session_id=session_id,
+        frame_qr_goods=goods,
+        frame_qr_text=goods,
+        frame_qr_tare=tare,
+        values={},
+        photos={},
+        step_index=0,
+        pending_photo_required=False,
+        pending_photo_param_key=None,
     )
     await clear_state_for_process(callback.from_user.id, "forming")
     await state.set_state(Process.param_menu)
@@ -995,9 +1015,18 @@ async def process_qr_code(message: Message, state: FSMContext):
         )
         if session_id:
             await state.update_data(
-                user_id=user.id, process_name="forming", forming_session_id=session_id,
-                step_index=0, sample_number=1, values={}, photos={},
-                pending_photo_required=False, pending_photo_param_key=None
+                user_id=user.id,
+                process_name="forming",
+                forming_session_id=session_id,
+                frame_qr_tare=tare_text,
+                frame_qr_goods=goods_text,
+                frame_qr_text=goods_text,
+                step_index=0,
+                sample_number=1,
+                values={},
+                photos={},
+                pending_photo_required=False,
+                pending_photo_param_key=None,
             )
             await state.set_state(Process.param_menu)
             await show_param_menu(message, state)
