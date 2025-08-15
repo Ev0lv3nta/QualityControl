@@ -302,16 +302,30 @@ async def save_state_to_db(user_id: int, state: FSMContext):
     if not process_name:
         logger.warning(f"User(id={user_id}) | Попытка сохранить состояние без process_name.")
         return
-    await db_execute(
-        """
-        INSERT INTO state_storage (user_id, process_name, state_data, updated_at)
-        VALUES ($1, $2, $3, NOW())
-        ON CONFLICT (user_id, process_name) DO UPDATE SET
-            state_data = EXCLUDED.state_data,
-            updated_at = NOW();
-        """,
-        user_id, process_name, json.dumps(data, ensure_ascii=False)
-    )
+    try:
+        success = await db_execute(
+            """
+            INSERT INTO state_storage (user_id, process_name, state_data, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (user_id, process_name) DO UPDATE SET
+                state_data = EXCLUDED.state_data,
+                updated_at = NOW();
+            """,
+            user_id, process_name, json.dumps(data, ensure_ascii=False)
+        )
+        if not success:
+            logger.error(
+                "Не удалось сохранить состояние в БД. user_id=%s, process=%s",
+                user_id,
+                process_name,
+            )
+    except Exception as e:
+        logger.error(
+            "Ошибка при сохранении состояния user_id=%s, process=%s: %s",
+            user_id,
+            process_name,
+            e,
+        )
 
 async def load_state_from_db(user_id: int, process_name: str, state: FSMContext) -> bool:
     record = await db_fetchall(
@@ -496,6 +510,15 @@ async def finish_process(message: Message, state: FSMContext):
         if goods: values['accumulation_qr_goods'] = goods
         if goods: values['accumulation_qr_text'] = goods  # совместимость
 
+    if process_name == 'packaging':
+        tare = data.get('packaging_qr_tare')
+        goods = data.get('packaging_qr_goods') or data.get('packaging_qr_text')
+        if tare:
+            values['packaging_qr_tare'] = tare
+        if goods:
+            values['packaging_qr_goods'] = goods
+            values['packaging_qr_text'] = goods  # совместимость
+
     if process_name == 'cgp':
         tare = data.get('cgp_qr_tare')
         goods = data.get('cgp_qr_goods') or data.get('cgp_qr_text')
@@ -605,6 +628,12 @@ def _cleanup_expired_tokens():
     for k, v in list(ACCUM_CONTINUE_TOKENS.items()):
         if (now - v.get('created_at', now)).total_seconds() > TOKEN_TTL_SECONDS:
             ACCUM_CONTINUE_TOKENS.pop(k, None)
+
+
+async def _token_cleanup_scheduler():
+    while True:
+        _cleanup_expired_tokens()
+        await asyncio.sleep(TOKEN_TTL_SECONDS)
 
 async def process_cancel_callback(callback: CallbackQuery, state: FSMContext):
     current_fsm_state = await state.get_state()
@@ -719,6 +748,15 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext):
             await state.update_data(process_name_after_qr="accumulation")
             await callback.message.edit_text("<b>Этап 2: Зона накопления ГП</b>\nОтправьте фото с двумя QR-кодами (слева тара, справа товар).", reply_markup=cancel_kb())
 
+    elif stage_name == "packaging":
+        await state.set_state(Process.waiting_for_qr)
+        await state.update_data(process_name_after_qr="packaging")
+        msg = await callback.message.edit_text(
+            "<b>Этап 3: Упаковка</b>\nОтправьте фото с двумя QR-кодами (слева тара, справа товар).",
+            reply_markup=cancel_kb(),
+        )
+        await state.update_data(last_bot_message_id=msg.message_id, chat_id=msg.chat.id)
+
     elif stage_name == "cgp":
         last_row = await db_fetchall(
             """
@@ -767,6 +805,7 @@ async def param_menu_done(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def accumulation_new_handler(callback: CallbackQuery, state: FSMContext):
+    _cleanup_expired_tokens()
     data_state = await state.get_data()
     last_id = data_state.get('last_bot_message_id')
     if last_id and callback.message.message_id != last_id: await callback.answer(); return
@@ -776,6 +815,7 @@ async def accumulation_new_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def accumulation_continue_handler(callback: CallbackQuery, state: FSMContext):
+    _cleanup_expired_tokens()
     data_state = await state.get_data()
     last_id = data_state.get('last_bot_message_id')
     if last_id and callback.message.message_id != last_id: await callback.answer(); return
@@ -834,15 +874,23 @@ async def forming_continue_handler(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def cgp_new_handler(callback: CallbackQuery, state: FSMContext):
+    _cleanup_expired_tokens()
     data_state = await state.get_data()
     last_id = data_state.get('last_bot_message_id')
-    if last_id and callback.message.message_id != last_id: await callback.answer(); return
+    if last_id and callback.message.message_id != last_id:
+        await callback.answer("Используйте кнопки из последнего сообщения.", show_alert=True)
+        return
     await state.set_state(Process.waiting_for_qr)
     await state.update_data(process_name_after_qr="cgp")
-    await callback.message.edit_text("<b>Этап 4: ЦГП</b>\nОтправьте фото ярлыка с двумя QR-кодами (слева тара, справа товар).", reply_markup=cancel_kb())
+    msg = await callback.message.edit_text(
+        "<b>Этап 4: ЦГП</b>\nОтправьте фото ярлыка с двумя QR-кодами (слева тара, справа товар).",
+        reply_markup=cancel_kb(),
+    )
+    await state.update_data(last_bot_message_id=msg.message_id, chat_id=msg.chat.id)
     await callback.answer()
 
 async def cgp_continue_handler(callback: CallbackQuery, state: FSMContext):
+    _cleanup_expired_tokens()
     data_state = await state.get_data()
     last_id = data_state.get('last_bot_message_id')
     if last_id and callback.message.message_id != last_id: await callback.answer(); return
@@ -987,7 +1035,23 @@ async def process_qr_code(message: Message, state: FSMContext):
         await show_param_menu(message, state)
 
     elif process_name_after_qr == "packaging":
-        await start_process(user.id, user.full_name, message, state, "packaging")
+        await state.set_state(Process.param_menu)
+        await state.update_data(
+            user_id=user.id,
+            process_name="packaging",
+            packaging_qr_tare=tare_text,
+            packaging_qr_goods=goods_text,
+            packaging_qr_text=goods_text,
+            packaging_qr_tg_file_id=file.file_id,
+            packaging_qr_image_path=local_file_path,
+            values={},
+            photos={},
+            pending_photo_required=False,
+            pending_photo_param_key=None,
+            control_dir=datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+        )
+        await clear_state_for_process(user.id, "packaging")
+        await show_param_menu(message, state)
 
     elif process_name_after_qr == "cgp":
         await state.set_state(Process.param_menu)
@@ -1011,9 +1075,16 @@ async def handle_param_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     param_key = data.get('pending_photo_param_key')
     process_name = data.get('pending_photo_process_name')
+    if not param_key or not process_name:
+        await message.answer(
+            "❌ Не удалось определить параметр или этап. Начните заново через главное меню."
+        )
+        return
     control_dir = data.get('control_dir') or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     file = await bot.get_file(message.photo[-1].file_id)
-    dest_path = build_control_photo_path(control_dir, process_name, param_key, getattr(file, 'file_path', None))
+    dest_path = build_control_photo_path(
+        control_dir, process_name, param_key, getattr(file, 'file_path', None)
+    )
     ok = await download_telegram_file_by_file_id(message.photo[-1].file_id, dest_path)
     if not ok:
         await message.answer("❌ Не удалось сохранить фото. Отправьте его ещё раз или нажмите '🏠 Главное меню'."); return
@@ -1216,6 +1287,7 @@ async def on_startup(bot: Bot):
         await bot.session.close()
         raise SystemExit(1)
     await bot.set_my_commands([BotCommand(command="/start", description="🏠 Главное меню")])
+    asyncio.create_task(_token_cleanup_scheduler())
 
 async def on_shutdown(bot: Bot):
     if db_pool: await db_pool.close()
