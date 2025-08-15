@@ -870,11 +870,12 @@ async def forming_continue_handler(callback: CallbackQuery, state: FSMContext):
         session_id = int(parts[1]) if len(parts) > 1 else None
     except Exception:
         session_id = None
-    goods = await db_fetchval("SELECT frame_qr_text FROM forming_sessions WHERE session_id = $1", session_id)
-    tare = await db_fetchval(
-        "SELECT data->>'frame_qr_tare' FROM control_data WHERE forming_session_id = $1 ORDER BY created_at DESC LIMIT 1",
+    row = await db_fetchall(
+        "SELECT frame_qr_text, frame_qr_tare FROM forming_sessions WHERE session_id = $1",
         session_id,
     )
+    goods = row[0]['frame_qr_text'] if row else None
+    tare = row[0]['frame_qr_tare'] if row else None
     await state.update_data(
         user_id=callback.from_user.id,
         process_name="forming",
@@ -999,19 +1000,16 @@ async def process_qr_code(message: Message, state: FSMContext):
         # goods_text остаётся ключом рамы (frame_qr_text)
         session_id = await db_fetchval(
             """
-            WITH ins AS (
-                INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tg_file_id, frame_qr_image_path)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT DO NOTHING
-                RETURNING session_id
-            )
-            SELECT session_id FROM ins
-            UNION ALL
-            SELECT session_id FROM forming_sessions
-            WHERE frame_qr_text = $2 AND user_id = $1 AND completed_at IS NULL
-            LIMIT 1;
+            INSERT INTO forming_sessions (user_id, frame_qr_text, frame_qr_tare, frame_qr_tg_file_id, frame_qr_image_path)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (frame_qr_text) DO UPDATE SET
+                user_id = EXCLUDED.user_id,
+                frame_qr_tare = EXCLUDED.frame_qr_tare,
+                frame_qr_tg_file_id = EXCLUDED.frame_qr_tg_file_id,
+                frame_qr_image_path = EXCLUDED.frame_qr_image_path
+            RETURNING session_id;
             """,
-            user.id, goods_text, file.file_id, local_file_path
+            user.id, goods_text, tare_text, file.file_id, local_file_path
         )
         if session_id:
             await state.update_data(
