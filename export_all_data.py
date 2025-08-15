@@ -132,6 +132,7 @@ for params in PARAM_TITLES.values():
     COLUMN_TITLES_RU.update(params)
 
 async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
+    # В запросе явно используем u.full_name, так как поля u.name в таблице нет
     query = """
         SELECT
             cd.user_id,
