@@ -4,13 +4,21 @@ import csv
 import asyncio
 from typing import Any, Dict, List, Set
 
+from dotenv import load_dotenv
 import asyncpg
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASS = os.getenv("DB_PASS", "")
-DB_NAME = os.getenv("DB_NAME", "qualitycontrol")
+load_dotenv("secrets.env")
+
+required_vars = ("DB_HOST", "DB_PORT", "DB_USER", "DB_PASS", "DB_NAME")
+for var in required_vars:
+    if var not in os.environ:
+        raise EnvironmentError(f"Environment variable {var} is not set")
+
+DB_HOST = os.environ["DB_HOST"]
+DB_PORT = int(os.environ["DB_PORT"])
+DB_USER = os.environ["DB_USER"]
+DB_PASS = os.environ["DB_PASS"]
+DB_NAME = os.environ["DB_NAME"]
 
 OUTPUT_FILE = "all_data.csv"
 
