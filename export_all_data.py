@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Set
 from dotenv import load_dotenv
 import asyncpg
 
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "")
+DB_NAME = os.getenv("DB_NAME", "qualitycontrol")
 # Загружаем переменные окружения из secrets.env и проверяем успех
 if not load_dotenv("secrets.env"):
     raise FileNotFoundError("Файл secrets.env не найден")
@@ -130,6 +135,7 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
     query = """
         SELECT
             cd.user_id,
+            u.name,
             u.full_name,
             u.position,
             cd.stage_name,
@@ -145,6 +151,13 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
         return await conn.fetch(query)
 
 async def export_all_data(filename: str = OUTPUT_FILE) -> None:
+    pool = await asyncpg.create_pool(
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        host=DB_HOST,
+        port=DB_PORT,
+    )
     try:
         pool = await asyncpg.create_pool(
             user=DB_USER,
@@ -172,12 +185,15 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
         row = {
             "created_at": rec["created_at"],
             "user_id": rec["user_id"],
+            "name": rec["name"],
             "full_name": rec["full_name"],
             "position": rec["position"],
+            "stage_name": rec["stage_name"],
             "stage_name": STAGE_TITLES.get(rec["stage_name"], rec["stage_name"]),
             "forming_session_id": rec["forming_session_id"],
             "value_numeric": rec["value_numeric"],
         }
+        row.update(data)
         row.update(
             {
                 k: (
@@ -193,6 +209,7 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
     base_columns = [
         "created_at",
         "user_id",
+        "name",
         "full_name",
         "position",
         "stage_name",
@@ -205,6 +222,7 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
 
     with open(filename, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
+        writer.writeheader()
         # Записываем русские заголовки колонок
         writer.writerow({k: COLUMN_TITLES_RU.get(k, k) for k in fieldnames})
         for row in rows:
