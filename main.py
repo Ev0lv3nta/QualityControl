@@ -407,6 +407,7 @@ async def show_param_menu(message: Message, state: FSMContext):
             stage_title = STAGE_TITLES.get(process_name, process_name)
             sent_message = await message.answer(f"Выберите параметр контроля ({stage_title}):", reply_markup=kb)
     await state.update_data(last_bot_message_id=sent_message.message_id, chat_id=sent_message.chat.id)
+    await save_state_to_db(data.get('user_id') or message.from_user.id, state)
 
 # =====================================================
 # FSM И ПРОЦЕССЫ
@@ -459,6 +460,7 @@ async def ask_current_question(message: Message, state: FSMContext, edit_message
         else:
             sent_message = await bot.send_message(message.chat.id, text=prompt, reply_markup=reply_markup)
     await state.update_data(last_bot_message_id=sent_message.message_id, chat_id=sent_message.chat.id)
+    await save_state_to_db(data.get('user_id') or message.from_user.id, state)
 
 async def finish_process(message: Message, state: FSMContext):
     data = await state.get_data()
