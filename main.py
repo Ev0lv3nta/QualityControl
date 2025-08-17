@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 import secrets
+import contextlib
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 import json
@@ -39,8 +40,9 @@ TOKEN_TTL_SECONDS = 3600  # 1 час
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ИЗМЕНЕНО: Достаточно одного вызова load_dotenv
+# Загрузка переменных окружения из .env и (опционально) secrets.env
 load_dotenv()
+load_dotenv("secrets.env")
 
 def require_env(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
@@ -100,6 +102,7 @@ PARAM_TITLES: Dict[str, Dict[str, str]] = {
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 db_pool: Optional[asyncpg.Pool] = None
+TOKEN_CLEANUP_TASK: Optional[asyncio.Task] = None
 
 # =====================================================
 # НОВОЕ: Фабрики CallbackData
@@ -317,13 +320,16 @@ async def db_fetchall(query: str, *args) -> List[asyncpg.Record]:
 # НОВОЕ: Работа с токенами в БД
 # =====================================================
 
-async def create_action_token(user_id: int, action_type: str, data: Dict[str, Any]) -> str:
+async def create_action_token(user_id: int, action_type: str, data: Dict[str, Any]) -> Optional[str]:
     token = secrets.token_urlsafe(16)
     expires_at = datetime.utcnow() + timedelta(seconds=TOKEN_TTL_SECONDS)
-    await db_execute(
+    success = await db_execute(
         "INSERT INTO action_tokens (token, user_id, action_type, token_data, expires_at) VALUES ($1, $2, $3, $4, $5)",
         token, user_id, action_type, json.dumps(data), expires_at
     )
+    if not success:
+        logger.error("Не удалось создать токен действия для пользователя %s", user_id)
+        return None
     return token
 
 async def get_action_token(token: str) -> Optional[Dict[str, Any]]:
@@ -344,13 +350,19 @@ async def delete_action_token(token: str):
     await db_execute("DELETE FROM action_tokens WHERE token = $1", token)
 
 async def cleanup_expired_tokens_db():
-    deleted_count = await db_fetchval("WITH deleted AS (DELETE FROM action_tokens WHERE expires_at < NOW() RETURNING 1) SELECT count(*) FROM deleted")
+    deleted_count = await db_fetchval(
+        "WITH deleted AS (DELETE FROM action_tokens WHERE expires_at < NOW() RETURNING 1) SELECT count(*) FROM deleted"
+    )
+    if deleted_count is None:
+        return
     if deleted_count > 0:
         logger.info(f"Удалено просроченных токенов из БД: {deleted_count}")
 
 async def _token_cleanup_scheduler():
     while True:
         await asyncio.sleep(TOKEN_TTL_SECONDS)
+        if not db_pool:
+            continue
         logger.info("Запуск очистки просроченных токенов...")
         await cleanup_expired_tokens_db()
 
@@ -751,21 +763,37 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext, ca
         if goods:
             token_data = {'goods': str(goods), 'tare': tare}
             token = await create_action_token(user.id, stage_name, token_data)
-            
+
+            if token:
+                if stage_name == "accumulation":
+                    builder.button(
+                        text=f"↩️ Продолжить раму {str(goods)[:40]}",
+                        callback_data=AccumulationCallback(action="continue", token=token)
+                    )
+                else:  # cgp
+                    builder.button(
+                        text=f"↩️ Продолжить паллет {str(goods)[:40]}",
+                        callback_data=CgpCallback(action="continue", token=token)
+                    )
+
             if stage_name == "accumulation":
-                builder.button(text=f"↩️ Продолжить раму {str(goods)[:40]}", callback_data=AccumulationCallback(action="continue", token=token))
                 builder.button(text="➕ Добавить новую раму", callback_data=AccumulationCallback(action="new"))
-            else: # cgp
-                builder.button(text=f"↩️ Продолжить паллет {str(goods)[:40]}", callback_data=CgpCallback(action="continue", token=token))
+            else:  # cgp
                 builder.button(text="➕ Сканировать новый паллет", callback_data=CgpCallback(action="new"))
-            
+
             builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
             builder.adjust(1)
-            await callback.message.edit_text(f"<b>{STAGE_TITLES[stage_name]}</b>\nВыберите действие:", reply_markup=builder.as_markup())
+            await callback.message.edit_text(
+                f"<b>{STAGE_TITLES[stage_name]}</b>\nВыберите действие:",
+                reply_markup=builder.as_markup()
+            )
         else:
             await state.set_state(Process.waiting_for_qr)
             await state.update_data(process_name_after_qr=stage_name)
-            await callback.message.edit_text(f"<b>{STAGE_TITLES[stage_name]}</b>\nОтправьте фото с QR-кодами (слева тара, справа товар).", reply_markup=cancel_kb())
+            await callback.message.edit_text(
+                f"<b>{STAGE_TITLES[stage_name]}</b>\nОтправьте фото с QR-кодами (слева тара, справа товар).",
+                reply_markup=cancel_kb()
+            )
             
     elif stage_name == "packaging":
         await state.set_state(Process.waiting_for_qr)
@@ -1090,10 +1118,16 @@ async def on_startup(bot: Bot):
     if not await create_db_pool():
         raise SystemExit(1)
     await bot.set_my_commands([BotCommand(command="/start", description="🏠 Главное меню")])
-    asyncio.create_task(_token_cleanup_scheduler())
+    global TOKEN_CLEANUP_TASK
+    TOKEN_CLEANUP_TASK = asyncio.create_task(_token_cleanup_scheduler())
 
 async def on_shutdown(bot: Bot):
-    if db_pool: await db_pool.close()
+    if TOKEN_CLEANUP_TASK:
+        TOKEN_CLEANUP_TASK.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await TOKEN_CLEANUP_TASK
+    if db_pool:
+        await db_pool.close()
     logger.info("Бот остановлен.")
 
 def register_handlers(dp: Dispatcher):
