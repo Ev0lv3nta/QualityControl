@@ -20,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, BotCommand, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # =====================================================
@@ -429,7 +430,7 @@ async def clear_state_for_process(user_id: int, process_name: str):
 
 def main_menu_kb() -> types.InlineKeyboardMarkup:
     # ИЗМЕНЕНО: Используем CallbackData
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="🔧 Этап 1: Формовка", callback_data=StageCallback(name="forming"))
     builder.button(text="📦 Этап 2: Зона накопления ГП", callback_data=StageCallback(name="accumulation"))
     builder.button(text="📋 Этап 3: Упаковка", callback_data=StageCallback(name="packaging"))
@@ -438,19 +439,19 @@ def main_menu_kb() -> types.InlineKeyboardMarkup:
     return builder.as_markup()
 
 def cancel_kb() -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
     return builder.as_markup()
 
 def full_nav_kb() -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data=ProcessNavCallback(action="back"))
     builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
     builder.adjust(1)
     return builder.as_markup()
 
 def choice_kb(choices: Dict[str, str], nav_kb: types.InlineKeyboardMarkup) -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     for text, val in choices.items():
         builder.button(text=text, callback_data=ChoiceCallback(value=val))
     builder.adjust(1)
@@ -460,7 +461,7 @@ def choice_kb(choices: Dict[str, str], nav_kb: types.InlineKeyboardMarkup) -> ty
     return builder.as_markup()
 
 def build_param_menu(process_name: str, filled_keys: set[str]) -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     chain = PROCESS_CHAINS.get(process_name, [])
     for step in chain:
         short = PARAM_TITLES.get(process_name, {}).get(step['key'], step['key'])
@@ -619,7 +620,7 @@ async def finish_process(message: Message, state: FSMContext):
             except Exception: pass
         
         await state.set_state(Process.forming_confirm_next)
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         builder.button(text="➕ Добавить еще образец", callback_data=FormingCallback(action="add_another"))
         builder.button(text="🏁 Завершить контроль рамы", callback_data=FormingCallback(action="finish"))
         sent_msg = await message.answer("Что делаем дальше?", reply_markup=builder.as_markup())
@@ -662,7 +663,7 @@ async def process_registration(message: Message, state: FSMContext):
     
     if await db_execute("INSERT INTO users (user_id, full_name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET full_name = $2", message.from_user.id, full_name):
         await state.set_state(Registration.waiting_for_position)
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         positions = ["Оператор/технолог", "Контролёр - технолог", "Оператор", "Оператор - наладчик"]
         for pos in positions:
             builder.button(text=pos, callback_data=RegistrationCallback(position=pos))
@@ -735,7 +736,7 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext, ca
         await callback.answer("Ваша прошлая сессия устарела из-за обновления и была сброшена. Начните заново.", show_alert=True)
     
     # Дальнейшая логика по этапам
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     if stage_name == "forming":
         active_forming = await db_fetchall("SELECT session_id, frame_qr_text AS code FROM forming_sessions WHERE user_id = $1 AND completed_at IS NULL ORDER BY created_at DESC LIMIT 1", user.id)
         if active_forming:
