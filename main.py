@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 # =====================================================
 
 # НОВОЕ: Версия структуры FSM. Меняйте, если вносите несовместимые изменения в PROCESS_CHAINS
-STATE_VERSION = 1
+STATE_VERSION = 2  # Увеличиваем версию из-за изменений в логике сохранения
 
 MAX_DB_RETRIES = 3
 DB_RETRY_DELAY = 2
@@ -201,7 +201,6 @@ def get_user_info(target: Message | CallbackQuery) -> str:
 async def download_telegram_file_by_file_id(file_id: str, destination_path: str) -> bool:
     try:
         file = await bot.get_file(file_id)
-        # ИЗМЕНЕНО: aiogram 3.x предпочитает download_file, fallback уже не так актуален, но оставим для надёжности.
         await bot.download_file(file.file_path, destination_path)
         return True
     except Exception as e:
@@ -271,6 +270,23 @@ def _sync_decode_multi_qr(image_path: str) -> List[Dict[str, Any]]:
 
 async def decode_multi_qr_from_image_async(image_path: str) -> List[Dict[str, Any]]:
     return await asyncio.to_thread(_sync_decode_multi_qr, image_path)
+
+# =====================================================
+# НОВОЕ: Функция для безопасного переключения процессов
+# =====================================================
+
+async def safe_switch_process(user_id: int, from_process: str, to_process: str, state: FSMContext):
+    """Безопасное переключение между процессами с сохранением черновиков"""
+    if from_process and from_process != to_process:
+        # Сохраняем текущий процесс
+        current_state = await state.get_state()
+        # Не сохраняем состояния ожидания фото/комментария
+        if current_state not in {Process.waiting_for_param_photo.state, 
+                                Process.waiting_for_param_comment.state}:
+            await save_state_to_db(user_id, state)
+        # Очищаем FSM для нового процесса
+        await state.clear()
+        logger.info(f"User {user_id}: Переключение с {from_process} на {to_process}")
 
 # =====================================================
 # БАЗА ДАННЫХ
@@ -368,21 +384,28 @@ async def _token_cleanup_scheduler():
         await cleanup_expired_tokens_db()
 
 # =====================================================
-# FSM ЧЕРНОВИКИ
+# FSM ЧЕРНОВИКИ - УЛУЧШЕННАЯ ВЕРСИЯ
 # =====================================================
 
 async def save_state_to_db(user_id: int, state: FSMContext):
     current_fsm_state = await state.get_state()
     if not current_fsm_state or not current_fsm_state.startswith('Process'):
         return
+    
+    # НОВОЕ: Не сохраняем состояния ожидания фото/комментария
+    if current_fsm_state in {Process.waiting_for_param_photo.state, 
+                            Process.waiting_for_param_comment.state}:
+        logger.info(f"User {user_id}: Пропускаем сохранение состояния {current_fsm_state}")
+        return
+    
     data = await state.get_data()
     data['fsm_state'] = current_fsm_state
-    # НОВОЕ: Добавляем версию состояния
     data['state_version'] = STATE_VERSION
     process_name = data.get('process_name')
     if not process_name:
         logger.warning(f"User(id={user_id}) | Попытка сохранить состояние без process_name.")
         return
+    
     await db_execute(
         """
         INSERT INTO state_storage (user_id, process_name, state_data, updated_at)
@@ -393,6 +416,7 @@ async def save_state_to_db(user_id: int, state: FSMContext):
         """,
         user_id, process_name, json.dumps(data, ensure_ascii=False)
     )
+    logger.info(f"User {user_id}: Состояние сохранено для процесса {process_name}")
 
 async def load_state_from_db(user_id: int, process_name: str, state: FSMContext) -> bool:
     record = await db_fetchall(
@@ -406,15 +430,39 @@ async def load_state_from_db(user_id: int, process_name: str, state: FSMContext)
         raw = record[0]['state_data']
         data = raw if isinstance(raw, dict) else json.loads(raw)
 
-        # НОВОЕ: Проверяем версию состояния
+        # Проверяем версию состояния
         if data.get('state_version') != STATE_VERSION:
             logger.warning(f"User(id={user_id}) | Версия черновика устарела. Черновик будет удален.")
             await clear_state_for_process(user_id, process_name)
-            return False # Возвращаем False, чтобы вызывающая функция знала, что сессия не восстановлена
-
-        await state.set_data(data)
+            return False
+        
+        # НОВОЕ: Проверяем целостность данных
+        if data.get('process_name') != process_name:
+            logger.error(f"Несоответствие process_name: {data.get('process_name')} != {process_name}")
+            await clear_state_for_process(user_id, process_name)
+            return False
+        
+        # НОВОЕ: Не восстанавливаем состояния ожидания фото/комментария
         fsm_state_str = data.get('fsm_state')
+        if fsm_state_str in {Process.waiting_for_param_photo.state, 
+                            Process.waiting_for_param_comment.state}:
+            # Сбрасываем pending флаги и возвращаемся в меню
+            data['pending_photo_required'] = False
+            data['pending_photo_param_key'] = None
+            data['pending_comment_required'] = False
+            data['pending_comment_param_key'] = None
+            # Очищаем незавершенное значение параметра
+            if key_to_clear := data.get('pending_photo_param_key') or data.get('pending_comment_param_key'):
+                values = data.get('values', {})
+                values.pop(key_to_clear, None)
+                values.pop(f"{key_to_clear}_comment", None)
+                data['values'] = values
+            fsm_state_str = Process.param_menu.state
+            logger.info(f"User {user_id}: Сброшено состояние ожидания, возврат в меню")
+        
+        await state.set_data(data)
         await state.set_state(fsm_state_str or Process.param_menu)
+        logger.info(f"User {user_id}: Состояние восстановлено для процесса {process_name}")
         return True
     except Exception as e:
         logger.error(f"Ошибка загрузки черновика: {e}")
@@ -423,13 +471,13 @@ async def load_state_from_db(user_id: int, process_name: str, state: FSMContext)
 
 async def clear_state_for_process(user_id: int, process_name: str):
     await db_execute("DELETE FROM state_storage WHERE user_id = $1 AND process_name = $2", user_id, process_name)
+    logger.info(f"User {user_id}: Очищен черновик для процесса {process_name}")
 
 # =====================================================
 # КЛАВИАТУРЫ
 # =====================================================
 
 def main_menu_kb() -> types.InlineKeyboardMarkup:
-    # ИЗМЕНЕНО: Используем CallbackData
     builder = InlineKeyboardBuilder()
     builder.button(text="🔧 Этап 1: Формовка", callback_data=StageCallback(name="forming"))
     builder.button(text="📦 Этап 2: Зона накопления ГП", callback_data=StageCallback(name="accumulation"))
@@ -497,11 +545,9 @@ async def show_param_menu(message: Message, state: FSMContext, edit_message: boo
         await state.update_data(last_bot_message_id=sent_message.message_id, chat_id=sent_message.chat.id)
         await save_state_to_db(data.get('user_id') or message.from_user.id, state)
 
-
 # =====================================================
 # FSM И ПРОЦЕССЫ
 # =====================================================
-# Логика функций start_process, ask_current_question, finish_process остается почти без изменений
 
 async def ask_current_question(message: Message, state: FSMContext, edit_message: bool = False):
     data = await state.get_data()
@@ -533,7 +579,6 @@ async def ask_current_question(message: Message, state: FSMContext, edit_message
     if sent_message:
         await state.update_data(last_bot_message_id=sent_message.message_id, chat_id=sent_message.chat.id)
         await save_state_to_db(data.get('user_id') or message.from_user.id, state)
-
 
 async def finish_process(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -634,7 +679,6 @@ async def finish_process(message: Message, state: FSMContext):
             except Exception: pass
         await message.answer("Выберите этап контроля:", reply_markup=main_menu_kb())
 
-
 # =====================================================
 # КОМАНДЫ И ХЭНДЛЕРЫ
 # =====================================================
@@ -684,54 +728,89 @@ async def process_registration_position_cb(callback: CallbackQuery, state: FSMCo
         await callback.message.answer("❌ Не удалось сохранить должность. Попробуйте ещё раз.")
     await callback.answer()
 
+# ИСПРАВЛЕННАЯ ВЕРСИЯ
 async def process_cancel_callback(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     current_fsm_state = await state.get_state()
-    # Логика отката значения, если юзер отменил ввод фото/комментария
+    
+    # ИСПРАВЛЕНО: При отмене из состояния ожидания фото/комментария
     if current_fsm_state in {Process.waiting_for_param_photo.state, Process.waiting_for_param_comment.state}:
         key_to_revert = data.get('pending_photo_param_key') or data.get('pending_comment_param_key')
         if key_to_revert:
-            values = data.get('values', {}); values.pop(key_to_revert, None)
-            photos = data.get('photos', {}); photos.pop(key_to_revert, None)
+            values = data.get('values', {})
+            values.pop(key_to_revert, None)
+            values.pop(f"{key_to_revert}_comment", None)  # Удаляем и комментарий если есть
+            photos = data.get('photos', {})
+            photos.pop(key_to_revert, None)
             await state.update_data(
-                values=values, photos=photos,
-                pending_photo_required=False, pending_photo_param_key=None,
-                pending_comment_required=False, pending_comment_param_key=None
+                values=values, 
+                photos=photos,
+                pending_photo_required=False, 
+                pending_photo_param_key=None,
+                pending_comment_required=False, 
+                pending_comment_param_key=None
             )
+        
+        # НОВОЕ: Возвращаемся в меню параметров, а не сохраняем состояние ожидания
+        await state.set_state(Process.param_menu)
+        await save_state_to_db(callback.from_user.id, state)
+    else:
+        # Сохраняем только если НЕ в состоянии ожидания фото/комментария
+        await save_state_to_db(callback.from_user.id, state)
     
-    await save_state_to_db(callback.from_user.id, state)
     try:
         await callback.message.edit_text("🏠 Вы в главном меню.", reply_markup=None)
-    except Exception: pass
+    except Exception: 
+        pass
     await callback.message.answer("Выберите этап контроля:", reply_markup=main_menu_kb())
     await callback.answer()
 
+# ИСПРАВЛЕННАЯ ВЕРСИЯ
 async def process_stage_selection(callback: CallbackQuery, state: FSMContext, callback_data: StageCallback):
     user = callback.from_user
     stage_name = callback_data.name
+    
+    # НОВОЕ: Проверяем, не переключаемся ли мы между разными процессами
+    current_data = await state.get_data()
+    current_process = current_data.get('process_name')
+    
+    # Если переключаемся на другой процесс - используем безопасное переключение
+    if current_process and current_process != stage_name:
+        await safe_switch_process(user.id, current_process, stage_name, state)
+    
     if not await ensure_user_registered(user.id, user.full_name):
-        await callback.answer("❌ Ошибка базы данных.", show_alert=True); return
+        await callback.answer("❌ Ошибка базы данных.", show_alert=True)
+        return
 
     is_loaded = await load_state_from_db(user.id, stage_name, state)
     if is_loaded:
         data = await state.get_data()
-        if last_message_id := data.get('last_bot_message_id'):
-            try: await bot.delete_message(data.get('chat_id'), last_message_id)
-            except Exception: pass
         
-        fsm_state = await state.get_state()
-        if fsm_state == Process.waiting_for_param_photo.state:
-            sent = await callback.message.answer("📷 Фото обязательно. Пришлите фото или вернитесь в меню.", reply_markup=cancel_kb())
-            await state.update_data(last_bot_message_id=sent.message_id, chat_id=sent.chat.id)
-        elif fsm_state == Process.waiting_for_param_comment.state:
-            sent = await callback.message.answer("📝 Требуется комментарий. Введите текст или вернитесь в меню.", reply_markup=cancel_kb())
-            await state.update_data(last_bot_message_id=sent.message_id, chat_id=sent.chat.id)
+        # НОВОЕ: Проверяем целостность загруженных данных
+        if stage_name != data.get('process_name'):
+            logger.warning(f"Несоответствие process_name при загрузке: {stage_name} != {data.get('process_name')}")
+            await clear_state_for_process(user.id, stage_name)
+            is_loaded = False
         else:
-            await state.set_state(Process.param_menu)
-            await show_param_menu(callback.message, state)
-        await callback.answer("↩️ Ваш прошлый сеанс восстановлен."); return
+            if last_message_id := data.get('last_bot_message_id'):
+                try: await bot.delete_message(data.get('chat_id'), last_message_id)
+                except Exception: pass
+            
+            fsm_state = await state.get_state()
+            # Эти состояния уже не должны загружаться, но проверим на всякий случай
+            if fsm_state == Process.waiting_for_param_photo.state:
+                await state.set_state(Process.param_menu)
+                await show_param_menu(callback.message, state)
+            elif fsm_state == Process.waiting_for_param_comment.state:
+                await state.set_state(Process.param_menu)
+                await show_param_menu(callback.message, state)
+            else:
+                await state.set_state(Process.param_menu)
+                await show_param_menu(callback.message, state)
+            await callback.answer("↩️ Ваш прошлый сеанс восстановлен.")
+            return
     
-    # ИЗМЕНЕНО: Если черновик не загружен (в т.ч. из-за старой версии), сообщаем об этом
+    # Если черновик не загружен (в т.ч. из-за старой версии), сообщаем об этом
     if not is_loaded and await db_fetchval("SELECT 1 FROM state_storage WHERE user_id = $1 AND process_name = $2", user.id, stage_name):
         await callback.answer("Ваша прошлая сессия устарела из-за обновления и была сброшена. Начните заново.", show_alert=True)
     
@@ -797,9 +876,17 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext, ca
             )
             
     elif stage_name == "packaging":
-        await state.set_state(Process.waiting_for_qr)
-        await state.update_data(process_name_after_qr="packaging")
-        await callback.message.edit_text("<b>Этап 3: Упаковка</b>\nОтправьте фото с QR-кодами (слева тара, справа товар).", reply_markup=cancel_kb())
+        # Убираем запрос QR, сразу начинаем процесс
+        await state.clear() # Очищаем состояние от предыдущих этапов
+        await state.set_state(Process.param_menu)
+        await state.update_data(
+            user_id=user.id, 
+            process_name="packaging",
+            values={}, 
+            photos={},
+            control_dir=datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        )
+        await show_param_menu(callback.message, state, edit_message=True)
 
     await callback.answer()
 
@@ -968,13 +1055,29 @@ async def process_qr_code(message: Message, state: FSMContext):
     await state.update_data(process_name_after_qr=None)
     await save_state_to_db(user.id, state)
 
-
+# УЛУЧШЕННАЯ ВЕРСИЯ
 async def handle_param_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     param_key = data.get('pending_photo_param_key')
     process_name = data.get('process_name')
-    if not param_key or not process_name:
-        await message.answer("❌ Ошибка. Начните заново через главное меню."); return
+    
+    # УЛУЧШЕНО: Более информативная проверка
+    if not param_key:
+        await message.answer("❌ Не указан параметр для фото. Вернитесь в меню и выберите параметр заново.")
+        await state.set_state(Process.param_menu)
+        await show_param_menu(message, state, edit_message=False)
+        return
+    
+    if not process_name:
+        await message.answer("❌ Не указан процесс. Начните заново через главное меню.")
+        await state.clear()
+        return
+    
+    # Проверяем, что мы действительно ожидаем фото
+    current_state = await state.get_state()
+    if current_state != Process.waiting_for_param_photo.state:
+        await message.answer("❌ Фото не ожидается. Используйте меню для навигации.")
+        return
 
     control_dir = data.get('control_dir') or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     file = await bot.get_file(message.photo[-1].file_id)
@@ -988,7 +1091,6 @@ async def handle_param_photo(message: Message, state: FSMContext):
     await state.update_data(photos=photos, pending_photo_required=False, pending_photo_param_key=None)
     await state.set_state(Process.param_menu)
     await show_param_menu(message, state, edit_message=False)
-
 
 async def handle_param_comment(message: Message, state: FSMContext):
     if not message.text:
@@ -1042,7 +1144,6 @@ async def process_step_answer(message: Message, state: FSMContext):
     else:
         await state.set_state(Process.param_menu)
         await show_param_menu(message, state, edit_message=False)
-
 
 async def process_choice_answer(callback: CallbackQuery, state: FSMContext, callback_data: ChoiceCallback):
     data = await state.get_data()
@@ -1121,6 +1222,7 @@ async def on_startup(bot: Bot):
     await bot.set_my_commands([BotCommand(command="/start", description="🏠 Главное меню")])
     global TOKEN_CLEANUP_TASK
     TOKEN_CLEANUP_TASK = asyncio.create_task(_token_cleanup_scheduler())
+    logger.info("Бот запущен с исправлениями багов v2")
 
 async def on_shutdown(bot: Bot):
     if TOKEN_CLEANUP_TASK:
