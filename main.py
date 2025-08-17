@@ -40,8 +40,9 @@ TOKEN_TTL_SECONDS = 3600  # 1 час
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ИЗМЕНЕНО: Достаточно одного вызова load_dotenv
+# Загрузка переменных окружения из .env и (опционально) secrets.env
 load_dotenv()
+load_dotenv("secrets.env")
 
 def require_env(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
