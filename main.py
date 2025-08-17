@@ -1219,7 +1219,6 @@ async def process_step_answer(message: Message, state: FSMContext):
     is_valid, error_msg = await validate_input(value_to_save, current_step)
     if not is_valid:
         await message.reply(f"⚠️ {error_msg}"); return
-    current_fsm_state = await state.get_state()
     current_values = data.get('values', {})
     current_values[current_step['key']] = value_to_save
     if current_step.get('require_photo_always'):
@@ -1235,9 +1234,9 @@ async def process_step_answer(message: Message, state: FSMContext):
         sent = await message.answer("📷 Фото обязательно. Пришлите фото или нажмите '🏠 Главное меню'.", reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="cancel_action")]]))
         await state.update_data(last_bot_message_id=sent.message_id, chat_id=sent.chat.id)
         return
-    await state.update_data(values=current_values, fsm_state=current_fsm_state)
-    await save_state_to_db(message.from_user.id, state)
     await state.set_state(Process.param_menu)
+    await state.update_data(values=current_values, fsm_state=Process.param_menu.state)
+    await save_state_to_db(message.from_user.id, state)
     await show_param_menu(message, state)
 
 async def process_choice_answer(callback: CallbackQuery, state: FSMContext):
@@ -1248,7 +1247,6 @@ async def process_choice_answer(callback: CallbackQuery, state: FSMContext):
     chain = PROCESS_CHAINS.get(process_name)
     if not chain or step_index >= len(chain) or chain[step_index]['type'] != 'choice':
         await callback.answer(); return
-    current_fsm_state = await state.get_state()
     value_to_save = callback.data.split(':')[-1]
     step_key = chain[step_index]['key']
     current_values = data.get('values', {})
@@ -1282,9 +1280,9 @@ async def process_choice_answer(callback: CallbackQuery, state: FSMContext):
         sent = await callback.message.answer(comment_prompt, reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="cancel_action")]]))
         await state.update_data(last_bot_message_id=sent.message_id, chat_id=sent.chat.id)
         await callback.answer(); return
-    await state.update_data(values=current_values, pending_photo_required=False, fsm_state=current_fsm_state)
-    await save_state_to_db(callback.from_user.id, state)
     await state.set_state(Process.param_menu)
+    await state.update_data(values=current_values, pending_photo_required=False, fsm_state=Process.param_menu.state)
+    await save_state_to_db(callback.from_user.id, state)
     await show_param_menu(callback.message, state)
     await callback.answer()
 
@@ -1307,8 +1305,9 @@ async def process_navigation(callback: CallbackQuery, state: FSMContext):
         process_name = data.get('process_name')
         chain = PROCESS_CHAINS.get(process_name)
         if not chain or not (0 <= step_index < len(chain)): await callback.answer(); return
-        await save_state_to_db(callback.from_user.id, state)
         await state.set_state(Process.param_menu)
+        await state.update_data(fsm_state=Process.param_menu.state)
+        await save_state_to_db(callback.from_user.id, state)
         await show_param_menu(callback.message, state)
     await callback.answer()
 
