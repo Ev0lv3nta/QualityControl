@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 import secrets
+import contextlib
 from typing import Optional, Dict, List, Any
 from datetime import datetime, timedelta
 import json
@@ -19,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, BotCommand, ReplyKeyboardRemove
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
 # =====================================================
@@ -39,8 +41,9 @@ TOKEN_TTL_SECONDS = 3600  # 1 час
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ИЗМЕНЕНО: Достаточно одного вызова load_dotenv
+# Загрузка переменных окружения из .env и (опционально) secrets.env
 load_dotenv()
+load_dotenv("secrets.env")
 
 def require_env(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
@@ -100,6 +103,7 @@ PARAM_TITLES: Dict[str, Dict[str, str]] = {
 bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 db_pool: Optional[asyncpg.Pool] = None
+TOKEN_CLEANUP_TASK: Optional[asyncio.Task] = None
 
 # =====================================================
 # НОВОЕ: Фабрики CallbackData
@@ -317,13 +321,16 @@ async def db_fetchall(query: str, *args) -> List[asyncpg.Record]:
 # НОВОЕ: Работа с токенами в БД
 # =====================================================
 
-async def create_action_token(user_id: int, action_type: str, data: Dict[str, Any]) -> str:
+async def create_action_token(user_id: int, action_type: str, data: Dict[str, Any]) -> Optional[str]:
     token = secrets.token_urlsafe(16)
     expires_at = datetime.utcnow() + timedelta(seconds=TOKEN_TTL_SECONDS)
-    await db_execute(
+    success = await db_execute(
         "INSERT INTO action_tokens (token, user_id, action_type, token_data, expires_at) VALUES ($1, $2, $3, $4, $5)",
         token, user_id, action_type, json.dumps(data), expires_at
     )
+    if not success:
+        logger.error("Не удалось создать токен действия для пользователя %s", user_id)
+        return None
     return token
 
 async def get_action_token(token: str) -> Optional[Dict[str, Any]]:
@@ -344,13 +351,19 @@ async def delete_action_token(token: str):
     await db_execute("DELETE FROM action_tokens WHERE token = $1", token)
 
 async def cleanup_expired_tokens_db():
-    deleted_count = await db_fetchval("WITH deleted AS (DELETE FROM action_tokens WHERE expires_at < NOW() RETURNING 1) SELECT count(*) FROM deleted")
+    deleted_count = await db_fetchval(
+        "WITH deleted AS (DELETE FROM action_tokens WHERE expires_at < NOW() RETURNING 1) SELECT count(*) FROM deleted"
+    )
+    if deleted_count is None:
+        return
     if deleted_count > 0:
         logger.info(f"Удалено просроченных токенов из БД: {deleted_count}")
 
 async def _token_cleanup_scheduler():
     while True:
         await asyncio.sleep(TOKEN_TTL_SECONDS)
+        if not db_pool:
+            continue
         logger.info("Запуск очистки просроченных токенов...")
         await cleanup_expired_tokens_db()
 
@@ -417,7 +430,7 @@ async def clear_state_for_process(user_id: int, process_name: str):
 
 def main_menu_kb() -> types.InlineKeyboardMarkup:
     # ИЗМЕНЕНО: Используем CallbackData
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="🔧 Этап 1: Формовка", callback_data=StageCallback(name="forming"))
     builder.button(text="📦 Этап 2: Зона накопления ГП", callback_data=StageCallback(name="accumulation"))
     builder.button(text="📋 Этап 3: Упаковка", callback_data=StageCallback(name="packaging"))
@@ -426,19 +439,19 @@ def main_menu_kb() -> types.InlineKeyboardMarkup:
     return builder.as_markup()
 
 def cancel_kb() -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
     return builder.as_markup()
 
 def full_nav_kb() -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     builder.button(text="⬅️ Назад", callback_data=ProcessNavCallback(action="back"))
     builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
     builder.adjust(1)
     return builder.as_markup()
 
 def choice_kb(choices: Dict[str, str], nav_kb: types.InlineKeyboardMarkup) -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     for text, val in choices.items():
         builder.button(text=text, callback_data=ChoiceCallback(value=val))
     builder.adjust(1)
@@ -448,7 +461,7 @@ def choice_kb(choices: Dict[str, str], nav_kb: types.InlineKeyboardMarkup) -> ty
     return builder.as_markup()
 
 def build_param_menu(process_name: str, filled_keys: set[str]) -> types.InlineKeyboardMarkup:
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     chain = PROCESS_CHAINS.get(process_name, [])
     for step in chain:
         short = PARAM_TITLES.get(process_name, {}).get(step['key'], step['key'])
@@ -607,7 +620,7 @@ async def finish_process(message: Message, state: FSMContext):
             except Exception: pass
         
         await state.set_state(Process.forming_confirm_next)
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         builder.button(text="➕ Добавить еще образец", callback_data=FormingCallback(action="add_another"))
         builder.button(text="🏁 Завершить контроль рамы", callback_data=FormingCallback(action="finish"))
         sent_msg = await message.answer("Что делаем дальше?", reply_markup=builder.as_markup())
@@ -650,7 +663,7 @@ async def process_registration(message: Message, state: FSMContext):
     
     if await db_execute("INSERT INTO users (user_id, full_name) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET full_name = $2", message.from_user.id, full_name):
         await state.set_state(Registration.waiting_for_position)
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         positions = ["Оператор/технолог", "Контролёр - технолог", "Оператор", "Оператор - наладчик"]
         for pos in positions:
             builder.button(text=pos, callback_data=RegistrationCallback(position=pos))
@@ -723,7 +736,7 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext, ca
         await callback.answer("Ваша прошлая сессия устарела из-за обновления и была сброшена. Начните заново.", show_alert=True)
     
     # Дальнейшая логика по этапам
-    builder = types.InlineKeyboardBuilder()
+    builder = InlineKeyboardBuilder()
     if stage_name == "forming":
         active_forming = await db_fetchall("SELECT session_id, frame_qr_text AS code FROM forming_sessions WHERE user_id = $1 AND completed_at IS NULL ORDER BY created_at DESC LIMIT 1", user.id)
         if active_forming:
@@ -751,21 +764,37 @@ async def process_stage_selection(callback: CallbackQuery, state: FSMContext, ca
         if goods:
             token_data = {'goods': str(goods), 'tare': tare}
             token = await create_action_token(user.id, stage_name, token_data)
-            
+
+            if token:
+                if stage_name == "accumulation":
+                    builder.button(
+                        text=f"↩️ Продолжить раму {str(goods)[:40]}",
+                        callback_data=AccumulationCallback(action="continue", token=token)
+                    )
+                else:  # cgp
+                    builder.button(
+                        text=f"↩️ Продолжить паллет {str(goods)[:40]}",
+                        callback_data=CgpCallback(action="continue", token=token)
+                    )
+
             if stage_name == "accumulation":
-                builder.button(text=f"↩️ Продолжить раму {str(goods)[:40]}", callback_data=AccumulationCallback(action="continue", token=token))
                 builder.button(text="➕ Добавить новую раму", callback_data=AccumulationCallback(action="new"))
-            else: # cgp
-                builder.button(text=f"↩️ Продолжить паллет {str(goods)[:40]}", callback_data=CgpCallback(action="continue", token=token))
+            else:  # cgp
                 builder.button(text="➕ Сканировать новый паллет", callback_data=CgpCallback(action="new"))
-            
+
             builder.button(text="🏠 Главное меню", callback_data=ProcessNavCallback(action="cancel"))
             builder.adjust(1)
-            await callback.message.edit_text(f"<b>{STAGE_TITLES[stage_name]}</b>\nВыберите действие:", reply_markup=builder.as_markup())
+            await callback.message.edit_text(
+                f"<b>{STAGE_TITLES[stage_name]}</b>\nВыберите действие:",
+                reply_markup=builder.as_markup()
+            )
         else:
             await state.set_state(Process.waiting_for_qr)
             await state.update_data(process_name_after_qr=stage_name)
-            await callback.message.edit_text(f"<b>{STAGE_TITLES[stage_name]}</b>\nОтправьте фото с QR-кодами (слева тара, справа товар).", reply_markup=cancel_kb())
+            await callback.message.edit_text(
+                f"<b>{STAGE_TITLES[stage_name]}</b>\nОтправьте фото с QR-кодами (слева тара, справа товар).",
+                reply_markup=cancel_kb()
+            )
             
     elif stage_name == "packaging":
         await state.set_state(Process.waiting_for_qr)
@@ -1090,10 +1119,16 @@ async def on_startup(bot: Bot):
     if not await create_db_pool():
         raise SystemExit(1)
     await bot.set_my_commands([BotCommand(command="/start", description="🏠 Главное меню")])
-    asyncio.create_task(_token_cleanup_scheduler())
+    global TOKEN_CLEANUP_TASK
+    TOKEN_CLEANUP_TASK = asyncio.create_task(_token_cleanup_scheduler())
 
 async def on_shutdown(bot: Bot):
-    if db_pool: await db_pool.close()
+    if TOKEN_CLEANUP_TASK:
+        TOKEN_CLEANUP_TASK.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await TOKEN_CLEANUP_TASK
+    if db_pool:
+        await db_pool.close()
     logger.info("Бот остановлен.")
 
 def register_handlers(dp: Dispatcher):
