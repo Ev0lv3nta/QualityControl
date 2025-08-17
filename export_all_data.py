@@ -115,6 +115,7 @@ COLUMN_TITLES_RU: Dict[str, str] = {
     "full_name": "ФИО",
     "position": "Должность",
     "stage_name": "Этап",
+    "stage_title": "Название этапа",
     "forming_session_id": "ID сессии формовки",
     "value_numeric": "Числовое значение",
     "frame_qr_goods": "QR рамы (товар)",
@@ -136,7 +137,6 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
     query = """
         SELECT
             cd.user_id,
-            u.name,
             u.full_name,
             u.position,
             cd.stage_name,
@@ -152,13 +152,6 @@ async def fetch_records(pool: asyncpg.Pool) -> List[asyncpg.Record]:
         return await conn.fetch(query)
 
 async def export_all_data(filename: str = OUTPUT_FILE) -> None:
-    pool = await asyncpg.create_pool(
-        user=DB_USER,
-        password=DB_PASS,
-        database=DB_NAME,
-        host=DB_HOST,
-        port=DB_PORT,
-    )
     try:
         pool = await asyncpg.create_pool(
             user=DB_USER,
@@ -178,19 +171,24 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
 
     data_keys: Set[str] = set()
     rows: List[Dict[str, Any]] = []
+    skipped = 0
     for rec in records:
         data = rec["data"]
         if not isinstance(data, dict):
-            data = json.loads(data)
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError as e:
+                print(f"Ошибка декодирования JSON: {e}. Запись пропущена")
+                skipped += 1
+                continue
         data_keys.update(data.keys())
         row = {
             "created_at": rec["created_at"],
             "user_id": rec["user_id"],
-            "name": rec["name"],
             "full_name": rec["full_name"],
             "position": rec["position"],
             "stage_name": rec["stage_name"],
-            "stage_name": STAGE_TITLES.get(rec["stage_name"], rec["stage_name"]),
+            "stage_title": STAGE_TITLES.get(rec["stage_name"], rec["stage_name"]),
             "forming_session_id": rec["forming_session_id"],
             "value_numeric": rec["value_numeric"],
         }
@@ -210,10 +208,10 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
     base_columns = [
         "created_at",
         "user_id",
-        "name",
         "full_name",
         "position",
         "stage_name",
+        "stage_title",
         "forming_session_id",
         "value_numeric",
     ]
@@ -228,6 +226,8 @@ async def export_all_data(filename: str = OUTPUT_FILE) -> None:
         writer.writerow({k: COLUMN_TITLES_RU.get(k, k) for k in fieldnames})
         for row in rows:
             writer.writerow(row)
+    if skipped:
+        print(f"Пропущено записей из-за ошибок JSON: {skipped}")
 
 if __name__ == "__main__":
     asyncio.run(export_all_data())
